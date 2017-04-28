@@ -136,6 +136,7 @@ defmodule MQTT.Client do
   @type start_options() :: %{
       :transport => {:tcp, map()} | {:ssl, map()},
       :keep_alive => non_neg_integer(),
+      :ping_timeout => non_neg_integer(),
       :protocol => iodata(),
       :username => iodata(),
       :password => iodata(),

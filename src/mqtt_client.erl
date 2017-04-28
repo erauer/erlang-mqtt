@@ -80,7 +80,8 @@
     client_id :: iodata(),
     clean_session :: boolean(),
     last_will :: undefined | #mqtt_last_will{},
-    keep_alive :: non_neg_integer()
+    keep_alive :: non_neg_integer(),
+    ping_timeout :: non_neg_integer()
 }).
 
 %% Data records
@@ -100,7 +101,8 @@
     transport_tags :: mqtt_transport:tags(),
     buffer = <<>> :: binary(),
     keep_alive_timer = undefined :: timer(keep_alive) | undefined,
-    ping_resp_timer = undefined :: timer(ping_resp) | undefined,
+    ping_timeout :: non_neg_integer(),
+    ping_timeout_timer = undefined :: timer(ping_timeout) | undefined,
     next_id = 0 :: mqtt_packet:packet_id(),
     pending_subscriptions = #{} :: #{mqtt_packet:packet_id() => [Topic :: iodata()]}
 }).
@@ -109,6 +111,7 @@
 -type start_options() :: #{
     transport => {tcp, map()} | {ssl, map()},
     keep_alive => non_neg_integer(),
+    ping_timeout => non_neg_integer(),
     protocol => iodata(),
     username => iodata(),
     password => iodata(),
@@ -130,6 +133,7 @@ start_link(Name, Module, Args, Opts) ->
 
 start_options(Opts) ->
     KeepAlive = maps:get(keep_alive, Opts, 0),
+    PingTimeout = maps:get(ping_timeout, Opts, 0),
     #options{
         transport = start_options_transport(KeepAlive, maps:get(transport, Opts, {tcp, #{}})),
         protocol = maps:get(protocol, Opts, <<"MQTT">>),
@@ -145,7 +149,8 @@ start_options(Opts) ->
                 Retain = maps:get(retain, LastWill, false),
                 #mqtt_last_will{topic = Topic, message = Message, qos = QoS, retain = Retain}
         end,
-        keep_alive = KeepAlive
+        keep_alive = KeepAlive,
+        ping_timeout = PingTimeout
     }.
 
 start_options_transport(KeepAlive, {Type, Opts}) ->
@@ -279,7 +284,8 @@ disconnected(internal, connect, Data) ->
         client_id = ClientId,
         clean_session = CleanSession,
         last_will = LastWill,
-        keep_alive = KeepAlive
+        keep_alive = KeepAlive,
+        ping_timeout = PingTimeout
     } = Options,
 
     case mqtt_transport:open(TransportType, Host, Port, TransportOpts, ConnectTimeout) of
@@ -307,7 +313,8 @@ disconnected(internal, connect, Data) ->
                     KeepAlive =:= 0 ->
                         undefined
                 end,
-                ping_resp_timer = undefined
+                ping_timeout = PingTimeout,
+                ping_timeout_timer = undefined
             })};
         {error, Error} ->
             handle_disconnect(Error, Data)
@@ -381,8 +388,8 @@ connected(cast, Cast, Data) ->
 connected(info, {timeout, Ref, keep_alive}, #connected{keep_alive_timer = {timer, Ref, keep_alive, _}} = Data) ->
     {keep_state, send_ping(Data)};
 
-connected(info, {timeout, Ref, ping_resp}, #connected{ping_resp_timer = {timer, Ref, ping_resp, _}} = Data) ->
-    throw(handle_disconnect(ping_timeout, Data));
+connected(info, {timeout, Ref, ping_timeout}, #connected{ping_timeout_timer = {timer, Ref, ping_timeout, _}} = Data) ->
+    handle_disconnect(ping_timeout, Data);
 
 connected(info, Info, Data) ->
     #connected{callback = Callback, callback_state = CallbackState} = Data,
@@ -395,8 +402,8 @@ connected(EventType, EventContent, Data) ->
 %% Extra handlers
 
 handle_event(internal, #mqtt_pingresp{}, Data) ->
-    #connected{ping_resp_timer = PingRespTimer} = Data,
-    {keep_state, Data#connected{ping_resp_timer = stop_timer(PingRespTimer)}};
+    #connected{ping_timeout_timer = PingTimeoutTimer} = Data,
+    {keep_state, Data#connected{ping_timeout_timer = stop_timer(PingTimeoutTimer)}};
 
 handle_event(_, _, _Data) ->
     keep_state_and_data.
@@ -429,9 +436,9 @@ handle_connect_error(Code, Data) ->
     end.
 
 handle_disconnect(Error, #connected{} = Data) ->
-    #connected{options = Options, callback = Callback, callback_state = CallbackState, transport = Transport, keep_alive_timer = KeepAliveTimer, ping_resp_timer = PingRespTimer} = Data,
+    #connected{options = Options, callback = Callback, callback_state = CallbackState, transport = Transport, keep_alive_timer = KeepAliveTimer, ping_timeout_timer = PingTimeoutTimer} = Data,
     _ = stop_timer(KeepAliveTimer),
-    _ = stop_timer(PingRespTimer),
+    _ = stop_timer(PingTimeoutTimer),
     _ = mqtt_transport:close(Transport),
 
     case Callback:handle_disconnect(Error, CallbackState) of
@@ -535,13 +542,12 @@ handle_action_unsubscribe(Topics, Data) ->
 
 
 %% Helpers
-send_ping(Data) ->
-  #connected{ping_resp_timer = PingRespTimer} = Data,
-  case PingRespTimer of
+send_ping(#connected{ping_timeout = PingTimeout, ping_timeout_timer = PingTimeoutTimer} = Data) ->
+  case PingTimeoutTimer of
     undefined ->
-        send(#mqtt_pingreq{}, Data#connected{ping_resp_timer = start_timer(10000,ping_resp)});
-   {timer, _, ping_resp, _} ->
-        send(#mqtt_pingreq{}, Data#connected{ping_resp_timer = restart_timer(PingRespTimer)})
+        send(#mqtt_pingreq{}, Data#connected{ping_timeout_timer = start_timer(PingTimeout * 1000, ping_timeout)});
+   {timer, _, ping_timeout, _} ->
+        send(#mqtt_pingreq{}, Data#connected{ping_timeout_timer = restart_timer(PingTimeoutTimer)})
   end.
 
 send(Packet, Data) ->
@@ -550,11 +556,14 @@ send(Packet, Data) ->
         ok ->
             Data#connected{keep_alive_timer = restart_timer(KeepAliveTimer)};
         Error ->
-            throw(handle_disconnect(Error, Data))
+            handle_disconnect(Error, Data)
     end.
 
 -spec start_timer(non_neg_integer(), Tag) -> timer(Tag) when Tag :: term().
 -type timer(Tag) :: {timer, reference(), Tag, MilliSecs :: non_neg_integer()}.
+start_timer(0, _) ->
+    undefined;
+
 start_timer(MilliSecs, Tag) ->
     Ref = erlang:start_timer(MilliSecs, self(), Tag),
     {timer, Ref, Tag, MilliSecs}.
